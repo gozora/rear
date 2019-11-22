@@ -147,10 +147,6 @@ if is_true $USING_UEFI_BOOTLOADER ; then
     # probably a bug, as I was able to boot with value set to root=anything
     root_uuid=$(get_root_disk_UUID)
 
-    # Grub2 modules that will be used for booting "Relax-and-Recover"
-    # It might be useful to make this variable global in the future
-    grub2_modules="linux echo all_video part_gpt ext2 btrfs search configfile"
-
     # Create configuration file for "Relax-and-Recover" UEFI boot entry.
     # This file will not interact with existing Grub2 configuration in any way.
     (   echo "menuentry '$grub_rear_menu_entry_name' --class os {"
@@ -171,9 +167,22 @@ if is_true $USING_UEFI_BOOTLOADER ; then
         echo "configfile (\$root)${grub_boot_dir}/grub${grub_num}/rear.cfg"
     ) > $grub_config_dir/rear_embed.cfg
 
+    # grub-mkimage needs /usr/lib/grub/x86_64-efi/moddep.lst (cf. https://github.com/rear/rear/issues/1193)
+    # and at least on SUSE systems grub2-mkimage needs /usr/lib/grub2/x86_64-efi/moddep.lst (in 'grub2' directory)
+    # so that we error out if grub-mkimage or grub2-mkimage would fail when its moddep.lst is missing.
+    # Careful: usr/sbin/rear sets nullglob so that /usr/lib/grub*/x86_64-efi/moddep.lst gets empty if nothing matches
+    # and 'test -f' succeeds with empty argument so that we cannot use 'test -f /usr/lib/grub*/x86_64-efi/moddep.lst'
+    # also 'test -n' succeeds with empty argument but (fortunately/intentionally?) plain 'test' fails with empty argument:
+    test /usr/lib/grub*/x86_64-efi/moddep.lst || Error "$gmkimage would not make bootable EFI image of GRUB2 (no /usr/lib/grub*/x86_64-efi/moddep.lst file)"
+    # As not all Linux distros have the same GRUB2 modules present we verify what we have (see also https://github.com/rear/rear/pull/2001)
+    local grub_module=""
+    local grub_modules=""
+    for grub_module in part_gpt part_msdos fat ext2 normal chain boot configfile linux linuxefi multiboot jfs iso9660 usb usbms usb_keyboard video udf ntfs all_video gzio efi_gop reboot search test echo btrfs lvm ; do
+        test "$( find /usr/lib/grub*/x86_64-efi -type f -name "$grub_module.mod" 2>/dev/null )" && grub_modules="$grub_modules $grub_module"
+    done
     # Create rear.efi at UEFI default boot directory location.
-    if ! grub${grub_num}-mkimage -o $boot_dir/efi/EFI/BOOT/rear.efi -O x86_64-efi -c $grub_config_dir/rear_embed.cfg -p /EFI/BOOT $grub2_modules ; then
-        Error "Could not create UEFI boot image"
+    if ! grub${grub_num}-mkimage $v -o $boot_dir/efi/EFI/BOOT/rear.efi -O x86_64-efi -c $grub_config_dir/rear_embed.cfg -p "/EFI/BOOT" $grub_modules ; then
+        Error "Failed to make bootable EFI image for GRUB_RESCUE=y"
     fi
 
     # If UEFI boot entry for "Relax-and-Recover" does not exist, create it.
