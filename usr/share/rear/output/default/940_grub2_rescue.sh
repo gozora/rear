@@ -180,21 +180,63 @@ if is_true $USING_UEFI_BOOTLOADER ; then
     # This will also add "Relax-and-Recover" to boot order because if UEFI entry is not listed in BootOrder,
     # it is not visible in UEFI boot menu.
     if [[ $(efibootmgr | grep -cw $grub_rear_menu_entry_name) -eq 0 ]]; then
-        # This part might not go that well with drivers like HPEs cciss...
-        # However UEFI booting is present since Gen8 (AFAIK), and cciss drivers were replaced by hpsa long time ago,
-        # so it looks like impossible configuration, lets wait ...
-        efi_disk_part=$(grep -w /boot/efi /proc/mounts | awk '{print $1}')
-        efi_disk=$(echo $efi_disk_part | sed -e 's/[0-9]//g')
-        efi_part=$(echo $efi_disk_part | sed -e 's/[^0-9]//g')
+        # Determine where the EFI System Partition (ESP) is mounted:
+        esp_mountpoint=$( df -P "$UEFI_BOOTLOADER" | tail -1 | awk '{print $6}' )
+        # Use /boot/efi as fallback ESP mountpoint:
+        test "$esp_mountpoint" || esp_mountpoint="/boot/efi"
+
+        BootEfiDev="$( mount | grep "$esp_mountpoint" | awk '{print $1}' )"
+        # /dev/sda1 or /dev/mapper/vol34_part2 or /dev/mapper/mpath99p4
+        Dev=$( get_device_name $BootEfiDev )
+        # 1 (must anyway be a low nr <9)
+        ParNr=$( get_partition_number $Dev )
+        # /dev/sda or /dev/mapper/vol34_part or /dev/mapper/mpath99p or /dev/mmcblk0p
+        Disk=$( echo ${Dev%$ParNr} )
+
+        # Strip trailing partition remainders like '_part' or '-part' or 'p'
+        # if we have 'mapper' in disk device name:
+        if [[ ${Dev/mapper//} != $Dev ]] ; then
+            # we only expect mpath_partX or mpathpX or mpath-partX
+            case $Disk in
+                (*p)     Disk=${Disk%p} ;;
+                (*-part) Disk=${Disk%-part} ;;
+                (*_part) Disk=${Disk%_part} ;;
+                (*)      Log "Unsupported kpartx partition delimiter for $Dev"
+            esac
+        fi
+
+        # For eMMC devices the trailing 'p' in the Disk value
+        # (as in /dev/mmcblk0p that is derived from /dev/mmcblk0p1)
+        # needs to be stripped (to get /dev/mmcblk0), otherwise the
+        # efibootmgr call fails because of a wrong disk device name.
+        # See also https://github.com/rear/rear/issues/2103
+        if [[ $Disk = *'/mmcblk'+([0-9])p ]] ; then
+            Disk=${Disk%p}
+        fi
+
+        # For NVMe devices the trailing 'p' in the Disk value
+        # (as in /dev/nvme0n1p that is derived from /dev/nvme0n1p1)
+        # needs to be stripped (to get /dev/nvme0n1), otherwise the
+        # efibootmgr call fails because of a wrong disk device name.
+        # See also https://github.com/rear/rear/issues/1564
+        if [[ $Disk = *'/nvme'+([0-9])n+([0-9])p ]] ; then
+            Disk=${Disk%p}
+        fi
 
         # Save current BootOrder, as during `efibootmgr -c ...' phase (creating of "Relax-and-Recover" UEFI boot entry),
         # newly created entry will be set as primary, which is not something we don't really want
         efi_boot_order=$(efibootmgr | grep "BootOrder" | cut -d ":" -f2)
-        efibootmgr -c -d $efi_disk -p $efi_part -L "$grub_rear_menu_entry_name" -l "\EFI\BOOT\rear.efi" > /dev/null 2>&1
-        rear_boot_id=$(efibootmgr | grep -w $grub_rear_menu_entry_name | cut -d " " -f1 | sed -e 's/[^0-9]//g')
 
-        # Set "Relax-and-Recover" as last entry in UEFI boot menu.
-        efibootmgr -o ${efi_boot_order},${rear_boot_id} > /dev/null 2>&1
+        LogPrint "Creating EFI Boot Manager entry '$grub_rear_menu_entry_name'"
+        Log efibootmgr --quiet --create --disk ${Disk} --part ${ParNr} --label "$grub_rear_menu_entry_name" --loader "\EFI\BOOT\rear.efi"
+
+        if efibootmgr --quiet --create --disk ${Disk} --part ${ParNr} --label "$grub_rear_menu_entry_name" --loader "\EFI\BOOT\rear.efi"; then
+            rear_boot_id=$(efibootmgr | grep -w $grub_rear_menu_entry_name | cut -d " " -f1 | sed -e 's/[^0-9]//g')
+            # Set "Relax-and-Recover" as last entry in UEFI boot menu.
+            efibootmgr -o ${efi_boot_order},${rear_boot_id} > /dev/null 2>&1
+        else
+            LogPrint "Failed to create EFI Boot Manager entry."
+        fi
     fi
 else
     # Create a GRUB 2 menu config file:
